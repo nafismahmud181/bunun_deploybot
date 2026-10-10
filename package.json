@@ -1,0 +1,14 @@
+{
+  "name": "bunun-deploybot",
+  "version": "1.0.0",
+  "description": "Telegram bot that deploys, restarts and reports on the Bunun apps through the Coolify API",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node bot.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=24"
+  }
+}
