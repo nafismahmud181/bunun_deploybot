@@ -17,13 +17,16 @@ const APPS = parseApps(
   env.APPS ||
     'backend:kss2ucneseuomueurdbmysqa,admin:lu4ijxuv9xjccx5mu6k5sgq0,storefront:owxmr2x8cjhjnctsvrkgh5rx',
 );
+// Optional extra lock: when set, only these Telegram accounts may even try to sign in.
 const ALLOWED = parseIds(env.ALLOWED_USER_IDS || '');
-const HEALTH_URL = env.HEALTH_URL || 'https://kss2ucneseuomueurdbmysqa.13.140.173.69.sslip.io/health';
+const API = (env.API_URL || 'https://kss2ucneseuomueurdbmysqa.13.140.173.69.sslip.io').replace(/\/$/, '');
+const HEALTH_URL = env.HEALTH_URL || `${API}/health`;
 const POLL_MS = 10_000;
 const DEPLOY_TIMEOUT_MS = 30 * 60_000;
+const LOGIN_TTL_MS = 5 * 60_000;
 
-if (!env.TELEGRAM_BOT_TOKEN || !env.COOLIFY_TOKEN || ALLOWED.size === 0) {
-  console.error('Set TELEGRAM_BOT_TOKEN, COOLIFY_TOKEN and ALLOWED_USER_IDS (your ID from @userinfobot).');
+if (!env.TELEGRAM_BOT_TOKEN || !env.COOLIFY_TOKEN || !env.BOT_API_SECRET) {
+  console.error('Set TELEGRAM_BOT_TOKEN, COOLIFY_TOKEN and BOT_API_SECRET.');
   process.exit(1);
 }
 
@@ -97,10 +100,72 @@ function buildTail(d, keep = 12) {
   }
 }
 
+// ---------- Bunun API: who may use the bot ----------
+
+async function api(path, body) {
+  const res = await fetch(`${API}/api/v1/bot/${path}`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-bot-secret': env.BOT_API_SECRET },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(20_000),
+  });
+  return { status: res.status, body: res.status === 204 ? null : await res.json().catch(() => ({})) };
+}
+
+/** The owner signed in on this Telegram account, or null. Asked before every command. */
+async function owner(telegramUserId) {
+  const r = await api('session', { telegramUserId });
+  if (r.status !== 200) throw new Error(`The store API refused the bot (${r.status}). Check BOT_API_SECRET on both.`);
+  return r.body.owner;
+}
+
+const audit = (telegramUserId, action, app, result) =>
+  api('audit', { telegramUserId, action, app, result }).catch((e) => console.warn('audit failed:', e.message));
+
+// Sign-in conversations in progress: chat id → { step, email, password, until }. Memory only.
+const logins = new Map();
+
+const LOGIN_ERRORS = {
+  INVALID_LOGIN: 'Email or password is incorrect.',
+  INVALID_CODE: 'That code is not right.',
+  ACCOUNT_LOCKED: 'Too many wrong attempts. Try again in 15 minutes.',
+  ACCOUNT_DISABLED: 'This admin account has been disabled.',
+  NOT_OWNER: 'Only the store owner can use this bot.',
+  TWO_FACTOR_NOT_SET_UP: 'Sign in to the admin panel once to set up two-factor first.',
+};
+
+async function startLogin(chatId) {
+  logins.set(chatId, { step: 'email', until: Date.now() + LOGIN_TTL_MS });
+  await send(chatId, '🔐 Sign in with your Bunun admin account (owner only).\n\nYour admin <b>email</b>:\n\n/cancel to stop.');
+}
+
+/** One step of the sign-in conversation. */
+async function loginStep(msg, state) {
+  const chatId = msg.chat.id;
+  const text = (msg.text ?? '').trim();
+  if (state.step === 'email') {
+    Object.assign(state, { step: 'password', email: text });
+    return send(chatId, 'Your admin <b>password</b> (I delete your message right after reading it):');
+  }
+  if (state.step === 'password') {
+    // Bots may delete messages in private chats, so the password doesn't stay in the chat.
+    await tg('deleteMessage', { chat_id: chatId, message_id: msg.message_id }).catch(() => {});
+    Object.assign(state, { step: 'code', password: text });
+    return send(chatId, 'The 6-digit <b>code</b> from your authenticator app:');
+  }
+  logins.delete(chatId);
+  const r = await api('link', { telegramUserId: msg.from.id, email: state.email, password: state.password, code: text });
+  state.password = undefined;
+  if (r.status === 200)
+    return send(chatId, `✅ Signed in as <b>${escapeHtml(r.body.name)}</b> (${escapeHtml(r.body.email)}).\n\n${HELP}`);
+  const why = LOGIN_ERRORS[r.body?.code] ?? escapeHtml(r.body?.message ?? `Sign-in failed (${r.status}).`);
+  return send(chatId, `❌ ${why}\nSend /start to try again.`);
+}
+
 const busy = new Set();
 
 /** Deploys (or restarts) one app and reports the result in the chat. Returns true on success. */
-async function run(chatId, app, kind) {
+async function run(chatId, app, kind, userId) {
   if (busy.has(app.name)) {
     await send(chatId, `⏳ <b>${app.name}</b> is already deploying or restarting.`);
     return false;
@@ -120,10 +185,12 @@ async function run(chatId, app, kind) {
     const id = started?.deployment_uuid;
     if (!id) {
       await edit(msg, `✅ ${app.name}: ${escapeHtml(started?.message ?? 'requested')}`);
+      audit(userId, kind, app.name, 'requested');
       return true;
     }
     await edit(msg, `🚀 ${verb} <b>${app.name}</b>… (queued, I'll report back)`);
     const d = await waitFor(id);
+    audit(userId, kind, app.name, `${d.status}${d.commit ? ` ${d.commit.slice(0, 7)}` : ''}`);
     if (d.status === 'finished') {
       const commit = d.commit ? ` · <code>${d.commit.slice(0, 7)}</code> ${escapeHtml(d.commit_message ?? '')}` : '';
       const took = d.created_at && d.updated_at ? ` in ${duration(d.created_at, d.updated_at)}` : '';
@@ -146,20 +213,20 @@ async function run(chatId, app, kind) {
   }
 }
 
-async function deploy(chatId, target) {
+async function deploy(chatId, target, userId) {
   if (target === 'all') {
     // The admin and storefront call the API, so the backend goes first.
     const backend = appByName('backend');
-    if (backend && !(await run(chatId, backend, 'deploy'))) {
+    if (backend && !(await run(chatId, backend, 'deploy', userId))) {
       await send(chatId, 'Stopped: the backend failed, so the others were not deployed.');
       return;
     }
-    await Promise.all(APPS.filter((a) => a !== backend).map((a) => run(chatId, a, 'deploy')));
+    await Promise.all(APPS.filter((a) => a !== backend).map((a) => run(chatId, a, 'deploy', userId)));
     return;
   }
   const app = appByName(target);
   if (!app) return send(chatId, 'Which app?', buttons('deploy', true));
-  await run(chatId, app, 'deploy');
+  await run(chatId, app, 'deploy', userId);
 }
 
 async function status(chatId) {
@@ -205,19 +272,24 @@ const HELP = [
   '/restart &lt;app&gt; — restart without rebuilding',
   '/status — what is running and the last deploy of each app',
   '/logs &lt;app&gt; — the latest log lines',
+  '/logout — sign this Telegram account out',
   'Leave out the app to get buttons.',
 ].join('\n');
 
-async function command(chatId, text) {
+/** Commands for a signed-in owner. */
+async function command(chatId, text, userId) {
   const [cmd, arg] = text.trim().split(/\s+/);
   switch (cmd.replace(/@.*$/, '').toLowerCase()) {
     case '/deploy':
     case '/redeploy':
-      return deploy(chatId, arg?.toLowerCase());
+      return deploy(chatId, arg?.toLowerCase(), userId);
     case '/restart': {
       const app = appByName(arg);
-      return app ? run(chatId, app, 'restart') : send(chatId, 'Restart which app?', buttons('restart'));
+      return app ? run(chatId, app, 'restart', userId) : send(chatId, 'Restart which app?', buttons('restart'));
     }
+    case '/logout':
+      await api('unlink', { telegramUserId: userId });
+      return send(chatId, '👋 Signed out. Send /start to sign in again.');
     case '/status':
       return status(chatId);
     case '/logs':
@@ -233,22 +305,42 @@ async function handle(update) {
   const msg = update.message ?? update.callback_query?.message;
   const from = update.message?.from ?? update.callback_query?.from;
   if (!msg || !from || msg.chat.type !== 'private') return;
-  if (!ALLOWED.has(from.id)) {
-    // Strangers get no reply at all, so the bot gives nothing away.
+  const chatId = msg.chat.id;
+  if (ALLOWED.size > 0 && !ALLOWED.has(from.id)) {
+    // Not on the optional allow-list: no reply at all.
     console.warn(`ignored a message from Telegram user ${from.id}`);
     return;
   }
+
   if (update.callback_query) {
     await tg('answerCallbackQuery', { callback_query_id: update.callback_query.id }).catch(() => {});
+    if (!(await owner(from.id))) return send(chatId, 'Please sign in first: /start');
     const [action, target] = update.callback_query.data.split(':');
-    if (action === 'deploy') return deploy(msg.chat.id, target);
-    if (action === 'restart' && appByName(target)) return run(msg.chat.id, appByName(target), 'restart');
-    if (action === 'logs') return logs(msg.chat.id, target);
+    if (action === 'deploy') return deploy(chatId, target, from.id);
+    if (action === 'restart' && appByName(target)) return run(chatId, appByName(target), 'restart', from.id);
+    if (action === 'logs') return logs(chatId, target);
     return;
   }
-  // Commands sent while the bot was down are skipped, so an old /deploy doesn't fire by surprise.
-  if (Date.now() / 1000 - msg.date > 120) return;
-  if (msg.text) await command(msg.chat.id, msg.text);
+
+  // Messages sent while the bot was down are skipped, so an old /deploy doesn't fire by surprise.
+  if (Date.now() / 1000 - msg.date > 120 || !msg.text) return;
+  const text = msg.text.trim();
+  const cmd = text.split(/\s+/)[0].replace(/@.*$/, '').toLowerCase();
+
+  if (cmd === '/cancel') {
+    logins.delete(chatId);
+    return send(chatId, 'Cancelled.');
+  }
+  const state = logins.get(chatId);
+  if (state && state.until < Date.now()) logins.delete(chatId);
+  else if (state && !text.startsWith('/')) return loginStep(msg, state);
+
+  const me = await owner(from.id);
+  if (cmd === '/start' || cmd === '/login' || !me) {
+    if (me) return send(chatId, `Signed in as <b>${escapeHtml(me.name)}</b>.\n\n${HELP}`);
+    return startLogin(chatId);
+  }
+  await command(chatId, text, from.id);
 }
 
 // Coolify checks that the container answers on its port.
@@ -260,9 +352,10 @@ await tg('setMyCommands', {
     { command: 'restart', description: 'Restart an app without rebuilding' },
     { command: 'status', description: 'What is running, last deploys, API health' },
     { command: 'logs', description: 'Latest log lines of an app' },
+    { command: 'logout', description: 'Sign this Telegram account out' },
   ],
 }).catch((e) => console.warn(e.message));
-console.log(`deploy bot started; ${ALLOWED.size} allowed user(s); apps: ${APPS.map((a) => a.name).join(', ')}`);
+console.log(`deploy bot started; allow-list: ${ALLOWED.size || 'off'}; apps: ${APPS.map((a) => a.name).join(', ')}`);
 
 let offset = 0;
 for (;;) {
@@ -275,7 +368,11 @@ for (;;) {
     for (const u of updates) {
       offset = u.update_id + 1;
       // Not awaited: a 5-minute deploy must not block other commands.
-      handle(u).catch((e) => console.error('update failed:', e.message));
+      handle(u).catch((e) => {
+        console.error('update failed:', e.message);
+        const chatId = (u.message ?? u.callback_query?.message)?.chat.id;
+        if (chatId) send(chatId, `⚠️ ${escapeHtml(e.message)}`).catch(() => {});
+      });
     }
   } catch (e) {
     console.error('polling:', e.message);
