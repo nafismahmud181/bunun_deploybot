@@ -31,7 +31,7 @@ See `.env.example`:
 - `COOLIFY_TOKEN`
 - `APPS` and `HEALTH_URL` (optional)
 
-While `ALLOWED_USER_IDS` is empty, the bot replies to anyone with their own Telegram user ID, so you can find yours.
+`ALLOWED_USER_IDS` is required: get your ID from @userinfobot in Telegram. Anyone else who messages the bot gets no reply at all.
 
 ## Run and test
 

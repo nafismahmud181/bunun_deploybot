@@ -22,8 +22,8 @@ const HEALTH_URL = env.HEALTH_URL || 'https://kss2ucneseuomueurdbmysqa.13.140.17
 const POLL_MS = 10_000;
 const DEPLOY_TIMEOUT_MS = 30 * 60_000;
 
-if (!env.TELEGRAM_BOT_TOKEN || !env.COOLIFY_TOKEN) {
-  console.error('Set TELEGRAM_BOT_TOKEN and COOLIFY_TOKEN.');
+if (!env.TELEGRAM_BOT_TOKEN || !env.COOLIFY_TOKEN || ALLOWED.size === 0) {
+  console.error('Set TELEGRAM_BOT_TOKEN, COOLIFY_TOKEN and ALLOWED_USER_IDS (your ID from @userinfobot).');
   process.exit(1);
 }
 
@@ -234,10 +234,8 @@ async function handle(update) {
   const from = update.message?.from ?? update.callback_query?.from;
   if (!msg || !from || msg.chat.type !== 'private') return;
   if (!ALLOWED.has(from.id)) {
+    // Strangers get no reply at all, so the bot gives nothing away.
     console.warn(`ignored a message from Telegram user ${from.id}`);
-    // Until anyone is allowed, tell the person their ID so it can be added to ALLOWED_USER_IDS.
-    if (ALLOWED.size === 0 && update.message)
-      await send(msg.chat.id, `Your Telegram user ID is <code>${from.id}</code>. Add it to ALLOWED_USER_IDS.`);
     return;
   }
   if (update.callback_query) {
